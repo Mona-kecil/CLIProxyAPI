@@ -173,6 +173,8 @@ func selectorStrategy(selector Selector) schedulerStrategy {
 		return schedulerStrategyFillFirst
 	case *WeightedRoundRobinSelector:
 		return schedulerStrategyWeightedRoundRobin
+	case *SoonestResetSelector:
+		return schedulerStrategyCustom
 	case nil, *RoundRobinSelector:
 		return schedulerStrategyRoundRobin
 	default:

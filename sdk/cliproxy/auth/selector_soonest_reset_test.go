@@ -196,3 +196,25 @@ func TestSoonestResetManagerPreservesAliasAvailability(t *testing.T) {
 		})
 	}
 }
+
+func TestSoonestResetSelectorPickLeavesCallerOrderIntact(t *testing.T) {
+	now := time.Now()
+	later := &Auth{ID: "a-later", Provider: "claude", Quota: QuotaState{Signals: map[string]string{
+		"Anthropic-Ratelimit-Unified-7d-Reset": strconv.FormatInt(now.Add(72*time.Hour).Unix(), 10),
+	}}}
+	sooner := &Auth{ID: "b-sooner", Provider: "claude", Quota: QuotaState{Signals: map[string]string{
+		"Anthropic-Ratelimit-Unified-7d-Reset": strconv.FormatInt(now.Add(time.Hour).Unix(), 10),
+	}}}
+	auths := []*Auth{later, sooner}
+	ctx := context.WithValue(context.Background(), prevalidatedAuthCandidatesKey{}, true)
+	picked, err := (&SoonestResetSelector{}).Pick(ctx, "claude", "", cliproxyexecutor.Options{}, auths)
+	if err != nil {
+		t.Fatalf("Pick: %v", err)
+	}
+	if picked != sooner {
+		t.Fatalf("picked %s, want b-sooner", picked.ID)
+	}
+	if auths[0] != later || auths[1] != sooner {
+		t.Fatalf("caller slice reordered to %s, %s", auths[0].ID, auths[1].ID)
+	}
+}

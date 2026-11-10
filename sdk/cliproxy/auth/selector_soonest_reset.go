@@ -82,7 +82,8 @@ func (s *SoonestResetSelector) Pick(ctx context.Context, provider, model string,
 	if err != nil {
 		return nil, err
 	}
-	available = preferCodexWebsocketAuths(ctx, provider, available)
+	// The candidate slice can alias the caller's, so sort a copy.
+	available = append([]*Auth(nil), preferCodexWebsocketAuths(ctx, provider, available)...)
 	ranks := make(map[*Auth]quotaResetRank, len(available))
 	for _, auth := range available {
 		ranks[auth] = rankByQuotaReset(auth, now)

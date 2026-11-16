@@ -17,15 +17,21 @@ import (
 )
 
 const (
-	claudeUsageURL              = "https://api.anthropic.com/api/oauth/usage"
-	claudeUsageBackfillInterval = 15 * time.Minute
-	claudeUsageFetchTimeout     = 15 * time.Second
-	claudeUsageMaxBodyBytes     = 1 << 20
+	claudeUsageURL               = "https://api.anthropic.com/api/oauth/usage"
+	claudeUsageBackfillTick      = time.Minute
+	claudeUsageFailureRetryDelay = 15 * time.Minute
+	claudeUsageFetchTimeout      = 15 * time.Second
+	claudeUsageMaxBodyBytes      = 1 << 20
 )
 
 // errClaudeQuotaKnown aborts a Modify edit when a real response filled the
 // quota signals after the usage lookup started.
 var errClaudeQuotaKnown = errors.New("claude quota already known")
+
+// errClaudeTokenNotReady marks a lookup skipped before any request because the
+// access token is missing or expired. Auto-refresh renews it shortly, so the
+// next tick retries instead of waiting out the failure delay.
+var errClaudeTokenNotReady = errors.New("access token missing or expired")
 
 type claudeUsageWindow struct {
 	// Utilization is a percent (0-100), unlike the fractional response header.
@@ -75,13 +81,12 @@ func parseClaudeUsage(body []byte) (map[string]string, error) {
 }
 
 // fetchClaudeUsage reads the usage endpoint, which costs no quota. It uses the
-// stored access token as is; an expired token fails with 401 and the next pass
-// retries after the regular refresh has renewed it.
+// stored access token as is and leaves renewal to the auto-refresh loop.
 func (m *Manager) fetchClaudeUsage(ctx context.Context, auth *Auth) ([]byte, error) {
-	token := authAccessToken(auth)
-	if token == "" {
-		return nil, errors.New("missing access token")
+	if !auth.HasValidAccessToken(time.Now()) {
+		return nil, errClaudeTokenNotReady
 	}
+	token := authAccessToken(auth)
 	client := &http.Client{Timeout: claudeUsageFetchTimeout}
 	proxyURL := strings.TrimSpace(auth.ProxyURL)
 	if proxyURL == "" {
@@ -120,8 +125,9 @@ func (m *Manager) fetchClaudeUsage(ctx context.Context, auth *Auth) ([]byte, err
 
 // backfillClaudeQuota fills the quota signals of every enabled Claude auth
 // whose weekly reset is unknown, so soonest-reset routing is correct before
-// any real response has taught it.
-func (m *Manager) backfillClaudeQuota(ctx context.Context) {
+// any real response has taught it. retryAt, when non-nil, holds back auths
+// whose last lookup failed until their retry time.
+func (m *Manager) backfillClaudeQuota(ctx context.Context, retryAt map[string]time.Time, retryDelay time.Duration) {
 	fetch := m.claudeUsageFetch
 	if fetch == nil {
 		fetch = m.fetchClaudeUsage
@@ -132,20 +138,27 @@ func (m *Manager) backfillClaudeQuota(ctx context.Context) {
 		}
 		if !strings.EqualFold(strings.TrimSpace(candidate.Provider), "claude") ||
 			candidate.Disabled || candidate.Status == StatusDisabled ||
-			rankByQuotaReset(candidate, time.Now()).known {
+			rankByQuotaReset(candidate, time.Now()).known ||
+			time.Now().Before(retryAt[candidate.ID]) {
 			continue
 		}
 		name := claudeAuthLogName(candidate)
 		fetchCtx, cancel := context.WithTimeout(ctx, claudeUsageFetchTimeout)
 		body, err := fetch(fetchCtx, candidate)
 		cancel()
-		if err != nil {
-			log.Warnf("claude usage backfill: fetch for %s failed: %v", name, err)
+		if errors.Is(err, errClaudeTokenNotReady) {
+			log.Debugf("claude usage backfill: %s: %v", name, err)
 			continue
 		}
-		signals, err := parseClaudeUsage(body)
+		var signals map[string]string
+		if err == nil {
+			signals, err = parseClaudeUsage(body)
+		}
 		if err != nil {
-			log.Warnf("claude usage backfill: %s: %v", name, err)
+			log.Warnf("claude usage backfill: lookup for %s failed: %v", name, err)
+			if retryAt != nil {
+				retryAt[candidate.ID] = time.Now().Add(retryDelay)
+			}
 			continue
 		}
 		if len(signals) == 0 {
@@ -179,21 +192,23 @@ func claudeAuthLogName(auth *Auth) string {
 }
 
 // StartClaudeUsageBackfill runs one backfill pass immediately, then one every
-// 15 minutes until ctx is cancelled.
+// minute until ctx is cancelled. Only unknown accounts are looked up, so a
+// steady state makes about one request per account per weekly reset.
 func (m *Manager) StartClaudeUsageBackfill(ctx context.Context) {
-	go m.runClaudeUsageBackfill(ctx, claudeUsageBackfillInterval)
+	go m.runClaudeUsageBackfill(ctx, claudeUsageBackfillTick, claudeUsageFailureRetryDelay)
 }
 
-func (m *Manager) runClaudeUsageBackfill(ctx context.Context, interval time.Duration) {
-	m.backfillClaudeQuota(ctx)
-	ticker := time.NewTicker(interval)
+func (m *Manager) runClaudeUsageBackfill(ctx context.Context, tick, retryDelay time.Duration) {
+	retryAt := make(map[string]time.Time)
+	m.backfillClaudeQuota(ctx, retryAt, retryDelay)
+	ticker := time.NewTicker(tick)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			m.backfillClaudeQuota(ctx)
+			m.backfillClaudeQuota(ctx, retryAt, retryDelay)
 		}
 	}
 }

@@ -150,7 +150,7 @@ func TestBackfillClaudeQuotaMakesSelectorPreferSoonerReset(t *testing.T) {
 		t.Fatalf("before backfill Pick() = %v, %v; want observed", before, err)
 	}
 
-	manager.backfillClaudeQuota(t.Context())
+	manager.backfillClaudeQuota(t.Context(), nil, 0)
 
 	after, err := selector.Pick(t.Context(), "claude", "", cliproxyexecutor.Options{}, managerAuths(t, manager, "observed", "unknown"))
 	if err != nil || after.ID != "unknown" {
@@ -177,7 +177,7 @@ func TestBackfillClaudeQuotaSkipsAccountsThatNeedNoLookup(t *testing.T) {
 		return claudeUsageBodyResetting(time.Now().Add(time.Hour), 10), nil
 	}, known, disabled, other)
 
-	manager.backfillClaudeQuota(t.Context())
+	manager.backfillClaudeQuota(t.Context(), nil, 0)
 
 	if got := calls.Load(); got != 0 {
 		t.Fatalf("fetch called %d times, want 0", got)
@@ -192,7 +192,7 @@ func TestBackfillClaudeQuotaRefetchesStaleReset(t *testing.T) {
 		return claudeUsageBodyResetting(next, 5), nil
 	}, stale)
 
-	manager.backfillClaudeQuota(t.Context())
+	manager.backfillClaudeQuota(t.Context(), nil, 0)
 
 	got, _ := manager.GetByID("stale")
 	if rank := rankByQuotaReset(got, time.Now()); !rank.known || rank.resetAt.Unix() != next.Unix() {
@@ -214,7 +214,7 @@ func TestBackfillClaudeQuotaFailuresLeaveAuthUnknownAndRetry(t *testing.T) {
 		return claudeUsageBodyResetting(time.Now().Add(time.Hour), 1), nil
 	}, unknown, healthy)
 
-	manager.backfillClaudeQuota(t.Context())
+	manager.backfillClaudeQuota(t.Context(), nil, 0)
 	for _, id := range []string{"unknown", "healthy"} {
 		got, _ := manager.GetByID(id)
 		if rankByQuotaReset(got, time.Now()).known || len(got.Quota.Signals) != 0 {
@@ -223,7 +223,7 @@ func TestBackfillClaudeQuotaFailuresLeaveAuthUnknownAndRetry(t *testing.T) {
 	}
 
 	failing = false
-	manager.backfillClaudeQuota(t.Context())
+	manager.backfillClaudeQuota(t.Context(), nil, 0)
 	got, _ := manager.GetByID("unknown")
 	if !rankByQuotaReset(got, time.Now()).known {
 		t.Fatal("next pass did not retry the failed account")
@@ -246,7 +246,7 @@ func TestBackfillClaudeQuotaDoesNotOverwriteSignalsLearnedDuringFetch(t *testing
 		return claudeUsageBodyResetting(time.Now().Add(time.Hour), 10), nil
 	}, auth)
 
-	manager.backfillClaudeQuota(t.Context())
+	manager.backfillClaudeQuota(t.Context(), nil, 0)
 
 	got, _ := manager.GetByID("racing")
 	if rank := rankByQuotaReset(got, time.Now()); rank.resetAt.Unix() != realReset.Unix() {
@@ -264,7 +264,7 @@ func TestClaudeUsageBackfillLoopRepeatsUntilCancelled(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan struct{})
 	go func() {
-		manager.runClaudeUsageBackfill(ctx, 5*time.Millisecond)
+		manager.runClaudeUsageBackfill(ctx, 5*time.Millisecond, 0)
 		close(done)
 	}()
 
@@ -281,5 +281,38 @@ func TestClaudeUsageBackfillLoopRepeatsUntilCancelled(t *testing.T) {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("loop did not stop after cancel")
+	}
+}
+
+func TestBackfillClaudeQuotaHoldsBackFailedLookupsUntilRetryTime(t *testing.T) {
+	failing := quotaResetTestAuth("failing", "claude", nil)
+	expired := quotaResetTestAuth("expired", "claude", nil)
+	calls := map[string]int{}
+	manager := newBackfillManager(t, func(_ context.Context, auth *Auth) ([]byte, error) {
+		calls[auth.ID]++
+		if auth.ID == "expired" {
+			return nil, errClaudeTokenNotReady
+		}
+		return nil, errors.New("usage endpoint returned status 429")
+	}, failing, expired)
+	retryAt := map[string]time.Time{}
+
+	manager.backfillClaudeQuota(t.Context(), retryAt, time.Hour)
+	manager.backfillClaudeQuota(t.Context(), retryAt, time.Hour)
+
+	if calls["failing"] != 1 {
+		t.Fatalf("failed lookup retried %d times within the retry delay, want 1 attempt", calls["failing"])
+	}
+	if calls["expired"] != 2 {
+		t.Fatalf("expired-token account checked %d times, want every pass (2)", calls["expired"])
+	}
+}
+
+func TestFetchClaudeUsageSkipsExpiredTokenWithoutRequest(t *testing.T) {
+	auth := quotaResetTestAuth("expired", "claude", nil)
+	auth.Metadata = map[string]any{"access_token": "tok", "expired": time.Now().Add(-time.Minute).Format(time.RFC3339)}
+	manager := NewManager(nil, &SoonestResetSelector{}, nil)
+	if _, err := manager.fetchClaudeUsage(t.Context(), auth); !errors.Is(err, errClaudeTokenNotReady) {
+		t.Fatalf("fetchClaudeUsage() error = %v, want errClaudeTokenNotReady", err)
 	}
 }

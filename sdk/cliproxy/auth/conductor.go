@@ -225,6 +225,9 @@ type Manager struct {
 	// It is initialized in NewManager; never Load() before first Store().
 	runtimeConfig atomic.Value
 
+	// claudeUsageFetch overrides the usage endpoint lookup; tests inject it.
+	claudeUsageFetch func(ctx context.Context, auth *Auth) ([]byte, error)
+
 	// Optional HTTP RoundTripper provider injected by host.
 	rtProvider RoundTripperProvider
 

@@ -20,6 +20,7 @@ const (
 	claudeUsageURL               = "https://api.anthropic.com/api/oauth/usage"
 	claudeUsageBackfillTick      = time.Minute
 	claudeUsageFailureRetryDelay = 15 * time.Minute
+	claudeUsageStartupBudget     = 10 * time.Second
 	claudeUsageFetchTimeout      = 15 * time.Second
 	claudeUsageMaxBodyBytes      = 1 << 20
 )
@@ -146,6 +147,9 @@ func (m *Manager) backfillClaudeQuota(ctx context.Context, retryAt map[string]ti
 		fetchCtx, cancel := context.WithTimeout(ctx, claudeUsageFetchTimeout)
 		body, err := fetch(fetchCtx, candidate)
 		cancel()
+		if ctx.Err() != nil {
+			return
+		}
 		if errors.Is(err, errClaudeTokenNotReady) {
 			log.Debugf("claude usage backfill: %s: %v", name, err)
 			continue
@@ -191,16 +195,21 @@ func claudeAuthLogName(auth *Auth) string {
 	return auth.ID
 }
 
-// StartClaudeUsageBackfill runs one backfill pass immediately, then one every
-// minute until ctx is cancelled. Only unknown accounts are looked up, so a
+// StartClaudeUsageBackfill runs the first backfill pass before returning, then
+// one every minute in the background until ctx is cancelled. The first pass
+// blocks so the server starts serving only once every reachable account is
+// ranked; otherwise clients reconnecting after a restart bind to whichever
+// account's lookup finished first. Only unknown accounts are looked up, so a
 // steady state makes about one request per account per weekly reset.
 func (m *Manager) StartClaudeUsageBackfill(ctx context.Context) {
-	go m.runClaudeUsageBackfill(ctx, claudeUsageBackfillTick, claudeUsageFailureRetryDelay)
+	retryAt := make(map[string]time.Time)
+	startupCtx, cancel := context.WithTimeout(ctx, claudeUsageStartupBudget)
+	m.backfillClaudeQuota(startupCtx, retryAt, claudeUsageFailureRetryDelay)
+	cancel()
+	go m.runClaudeUsageBackfill(ctx, retryAt, claudeUsageBackfillTick, claudeUsageFailureRetryDelay)
 }
 
-func (m *Manager) runClaudeUsageBackfill(ctx context.Context, tick, retryDelay time.Duration) {
-	retryAt := make(map[string]time.Time)
-	m.backfillClaudeQuota(ctx, retryAt, retryDelay)
+func (m *Manager) runClaudeUsageBackfill(ctx context.Context, retryAt map[string]time.Time, tick, retryDelay time.Duration) {
 	ticker := time.NewTicker(tick)
 	defer ticker.Stop()
 	for {

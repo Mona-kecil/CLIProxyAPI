@@ -264,7 +264,7 @@ func TestClaudeUsageBackfillLoopRepeatsUntilCancelled(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan struct{})
 	go func() {
-		manager.runClaudeUsageBackfill(ctx, 5*time.Millisecond, 0)
+		manager.runClaudeUsageBackfill(ctx, nil, 5*time.Millisecond, 0)
 		close(done)
 	}()
 
@@ -314,5 +314,25 @@ func TestFetchClaudeUsageSkipsExpiredTokenWithoutRequest(t *testing.T) {
 	manager := NewManager(nil, &SoonestResetSelector{}, nil)
 	if _, err := manager.fetchClaudeUsage(t.Context(), auth); !errors.Is(err, errClaudeTokenNotReady) {
 		t.Fatalf("fetchClaudeUsage() error = %v, want errClaudeTokenNotReady", err)
+	}
+}
+
+func TestStartClaudeUsageBackfillRanksAccountsBeforeReturning(t *testing.T) {
+	first := quotaResetTestAuth("first", "claude", nil)
+	second := quotaResetTestAuth("second", "claude", nil)
+	reset := time.Now().Add(24 * time.Hour)
+	manager := newBackfillManager(t, func(context.Context, *Auth) ([]byte, error) {
+		return claudeUsageBodyResetting(reset, 10), nil
+	}, first, second)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	manager.StartClaudeUsageBackfill(ctx)
+
+	for _, id := range []string{"first", "second"} {
+		got, _ := manager.GetByID(id)
+		if !rankByQuotaReset(got, time.Now()).known {
+			t.Fatalf("%s still unknown when StartClaudeUsageBackfill returned", id)
+		}
 	}
 }
